@@ -148,6 +148,48 @@ static __inline BOOL WaitFileAsync(HANDLE h, DWORD dwTimeout)
 }
 
 /// <summary>
+/// Windows 7 compatible replacement for GetOverlappedResultEx(), which only exists on Windows 8 and later.
+/// Uses the native API when kernel32 exports it, and otherwise emulates it with
+/// WaitForSingleObjectEx() followed by GetOverlappedResult().
+/// </summary>
+static __inline BOOL GetOverlappedResultExCompat(HANDLE hFile, LPOVERLAPPED lpOverlapped,
+	LPDWORD lpNumberOfBytesTransferred, DWORD dwMilliseconds, BOOL bAlertable)
+{
+	typedef BOOL(WINAPI* GetOverlappedResultEx_t)(HANDLE, LPOVERLAPPED, LPDWORD, DWORD, BOOL);
+	static GetOverlappedResultEx_t pGetOverlappedResultEx = NULL;
+	static BOOL resolved = FALSE;
+	DWORD r;
+
+	if (!resolved) {
+		HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+		if (hKernel32 != NULL)
+			pGetOverlappedResultEx = (GetOverlappedResultEx_t)(void*)GetProcAddress(hKernel32, "GetOverlappedResultEx");
+		resolved = TRUE;
+	}
+	if (pGetOverlappedResultEx != NULL)
+		return pGetOverlappedResultEx(hFile, lpOverlapped, lpNumberOfBytesTransferred, dwMilliseconds, bAlertable);
+
+	// Windows 7 fallback
+	if (!HasOverlappedIoCompleted(lpOverlapped) && dwMilliseconds != 0) {
+		r = WaitForSingleObjectEx((lpOverlapped->hEvent != NULL) ? lpOverlapped->hEvent : hFile,
+			dwMilliseconds, bAlertable);
+		switch (r) {
+		case WAIT_OBJECT_0:
+			break;
+		case WAIT_IO_COMPLETION:
+			SetLastError(WAIT_IO_COMPLETION);
+			return FALSE;
+		case WAIT_TIMEOUT:
+			SetLastError(WAIT_TIMEOUT);
+			return FALSE;
+		default:
+			return FALSE;	// WAIT_FAILED: last error is already set
+		}
+	}
+	return GetOverlappedResult(hFile, lpOverlapped, lpNumberOfBytesTransferred, FALSE);
+}
+
+/// <summary>
 /// Return the number of bytes read or written and keep track/update the
 /// current offset for an asynchronous read operation.
 /// </summary>
@@ -168,7 +210,7 @@ static __inline BOOL GetSizeAsync(HANDLE h, LPDWORD lpNumberOfBytes)
 		return FALSE;
 	}
 	fd->Overlapped.bOffsetUpdated = TRUE;
-	if (!GetOverlappedResultEx(fd->hFile, (OVERLAPPED*)&fd->Overlapped,
+	if (!GetOverlappedResultExCompat(fd->hFile, (OVERLAPPED*)&fd->Overlapped,
 		lpNumberOfBytes, WRITE_TIMEOUT, (fd->iStatus < 0)))
 		// When reading from VHD/VHDX we get SECTOR_NOT_FOUND rather than EOF for the end of the drive
 		return (GetLastError() == ERROR_HANDLE_EOF || GetLastError() == ERROR_SECTOR_NOT_FOUND);
